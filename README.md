@@ -1,10 +1,6 @@
 # cenilko-data
 
-Public release-asset host for Cenilko's offline data bundle.
+Data files used by the Cenilko application.
 
-The generated files are staged locally under `release/` and uploaded to the
-GitHub Release tagged `data`. The `release/` directory is intentionally ignored:
-the artifacts are GitHub Release assets, not Git objects.
-
-Upload artifacts first and `manifest.json` last so clients never receive a
-manifest that references an asset that is not available yet.
+The files are generated from publicly available sources. See the main Cenilko
+project and the application itself for source attribution and licensing details.
