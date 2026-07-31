@@ -5,9 +5,10 @@ offline-first Android/iOS app for the Slovenian real-estate market (GURS ETN
 recorded sales and rentals since 2007, price map, area statistics, comparable-sales
 estimator, cadastre lookup, mortgage tools, price alerts).
 
-This repository holds almost no code. Its job is to be the anonymous,
-unauthenticated download endpoint the app talks to at runtime: the artifacts are
-**GitHub Release assets**, not Git objects.
+This repository holds almost no code. It used to be the download endpoint itself,
+serving the artifacts as **GitHub Release assets**. Distribution now runs from a
+**Cloudflare R2 bucket** on the custom domain `https://data.2madlabs.si`, so what
+is left here is this documentation plus a local staging directory.
 
 The artifacts themselves are produced elsewhere — by the Python (uv) pipeline in
 the `cenilko-android` repository (`pipeline/`), which downloads the yearly ETN
@@ -16,20 +17,37 @@ overlays and `manifest.json`.
 
 ## How distribution works
 
-- One **rolling GitHub Release** under the tag `data`. The weekly and full data
-  jobs overwrite its assets in place (`gh release upload --clobber`); the tag and
-  the release are never recreated per build.
-- The app's release build has the manifest URL compiled in:
-  `https://github.com/2madlabs/cenilko-data/releases/download/data/manifest.json`
-  (`MANIFEST_URL` in `app/build.gradle.kts`). Debug builds point at
+- One **Cloudflare R2 bucket**, `cenilko-data`, published anonymously on the
+  custom domain `https://data.2madlabs.si`. Every object sits flat at the bucket
+  root. Artifact names carry a content hash, so a rebuild writes a new object
+  instead of replacing one; only `manifest.json` is overwritten in place.
+- The apps have the manifest URL compiled in:
+  `https://data.2madlabs.si/manifest.json` (`MANIFEST_URL` in
+  `app/build.gradle.kts` on Android, the default source in
+  `ArtifactManifest.swift` on iOS). Debug builds point at
   `http://127.0.0.1:8765/manifest.json` instead.
 - Artifact `url` values in the manifest are **relative to the manifest's own
-  location**, so the same bundle can be served from GitHub Releases, object
-  storage, or a local `http.server` without regenerating it.
-- The repository must stay **public**. The app downloads assets anonymously; the
-  `data-full` workflow explicitly fails if visibility is anything else.
+  location**, so the same bundle can be served from R2, any other object storage,
+  or a local `http.server` without regenerating it. The move off GitHub Releases
+  changed only the base URL; the manifest itself is untouched.
+- `Cache-Control` is set per object at upload time. Content-hashed artifacts are
+  `public, max-age=31536000, immutable`; `manifest.json` is
+  `public, max-age=300, must-revalidate`, so a new bundle becomes visible within
+  five minutes.
 - Upload order matters: artifacts first, `manifest.json` last. A client must never
-  fetch a manifest that references an asset that is not published yet.
+  fetch a manifest that references an object that is not published yet.
+
+### The frozen GitHub release
+
+The old rolling release under the tag `data` still exists and still serves its
+last set of assets from
+`https://github.com/2madlabs/cenilko-data/releases/download/data/manifest.json`.
+It is frozen: CI no longer touches it, so the data behind it goes stale from the
+cutover onwards. It is kept only so pre-migration internal-test builds, which have
+that URL compiled in, keep syncing something until they are replaced. The
+repository stays public for as long as that release has to be reachable. Once
+those builds are gone, the release can be deleted and this repository can go
+private or be archived.
 
 ## Repository layout
 
@@ -39,8 +57,8 @@ README.md      # this file
 release/       # local staging copy of the generated bundle — NOT committed
 ```
 
-`release/` is where the pipeline output is staged before being uploaded as release
-assets. It is listed in `.gitignore` and must never be committed: the base
+`release/` is where the pipeline output is staged before being uploaded to the
+bucket. It is listed in `.gitignore` and must never be committed: the base
 artifact alone is ~100 MB, past GitHub's per-file limit for Git objects.
 
 ## Bundle contents
@@ -119,7 +137,7 @@ Every asset is wrapped in a chunked AES-256-GCM envelope before upload
   This lets the app authenticate and write one record at a time instead of
   buffering a 100 MB asset in memory.
 
-This is a **deterrent, not access control**. The release stays anonymously
+This is a **deterrent, not access control**. The bucket stays anonymously
 downloadable and the client necessarily ships the same 32-byte key, which a
 determined person can recover from the APK. Its only purpose is to stop casual
 inspection of the raw files in a browser.
@@ -140,13 +158,24 @@ here:
   carries base/flood/terrain/constraints forward, verifies, republishes.
 - **`data-full`** — yearly rebuild of everything, including base.
 
-Both share a concurrency group so they can never publish to the rolling release at
-the same time. Both run `pipeline/verify_release.py` as a hard gate before any
-upload: it checks encrypted asset size and hash, performs an authenticated
-decryption, checks the raw sha256 of locally built files, and re-verifies
-carried-forward entries against what is actually published. Publishing needs two
-secrets on the app repo: `CENILKO_DATA_TOKEN` (contents:write here) and
-`CENILKO_DATA_KEY_B64`.
+Both share a concurrency group so they can never write to the bucket at the same
+time. Both run `pipeline/verify_release.py` as a hard gate before any upload: it
+checks encrypted asset size and hash, performs an authenticated decryption, checks
+the raw sha256 of locally built files, and re-verifies carried-forward entries
+against what is actually published.
+
+Uploads go through R2's S3-compatible API with the AWS CLI that is preinstalled on
+the runners, against the account's `*.r2.cloudflarestorage.com` endpoint. Each job
+uploads the rebuilt artifacts first, then `manifest.json`, then garbage-collects:
+any object other than `manifest.json` that the new manifest does not reference and
+that is older than 14 days is deleted. The grace period means a client that is
+mid-sync against the previous manifest never hits a 404.
+
+Publishing needs three secrets on the app repo: `CENILKO_DATA_KEY_B64` (the
+artifact key) and `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` (an R2 API token
+scoped to this bucket). The account id, bucket name and endpoint are plain values
+in the workflows. `CENILKO_DATA_TOKEN`, the old contents:write token for this
+repository, is no longer used.
 
 ## Working with the bundle locally
 
@@ -165,10 +194,13 @@ To inspect an already-published asset, decrypt it with `iter_decrypted()` from
 
 ## Recovery
 
-- **Weekly job failed** — fix and re-run. The release tag still holds the last good
+- **Weekly job failed** — fix and re-run. The bucket still holds the last good
   pair; clients are unaffected.
-- **Bad artifact published** — rebuild and re-run the workflow. Versions are
-  content-derived, so clients pick up the replacement on their next sync.
+- **Bad artifact published** — rebuild and re-run the workflow. It republishes to
+  R2 in the usual order. Versions are content-derived, so clients pick up the
+  replacement on their next sync, at most five minutes after the new
+  `manifest.json` lands. The superseded objects stay reachable and are removed by
+  the cleanup step once they are 14 days old.
 - **Corrupt files on a device** — Settings → "Re-download data" force-fetches the
   pair; the existing database keeps serving until the new one opens.
 
